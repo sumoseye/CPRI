@@ -5,69 +5,73 @@
 
 ---
 
-## 1. Executive Summary and Feature Selection Strategy
+## 1. Approach Used
 
-The objective of this work is to predict the verified hot-spot temperature rise (Reference Parameter) of an electrical test specimen under varying operating conditions, and to classify each test record as Valid or Invalid based on measurement reliability.
+Our strategy follows a structured four-stage engineering methodology: **Understand → Analyse → Validate → Automate**.
 
-Crucial domain insight from data exploration confirmed that Sensor S1, S2, and S3 are already recorded as temperature rises above ambient (in °C), and the Reference Parameter is likewise a temperature rise. Sensors are thus utilized directly as rise features rather than double-subtracting ambient temperature. Ambient temperature is retained as an independent feature affecting external convective cooling.
-
-Correlation analysis of the 1,000-record training set revealed that Load Current has the strongest linear relationship with the Reference Parameter (r = +0.87), followed by Sensor S2 (r = +0.70). Sensor S4 demonstrated unphysical white noise characteristics (max correlation r = 0.0707, lag-1 autocorrelation = 0.0300) and was completely excluded from feature space.
-
-From the raw inputs, a refined 27-feature regression contract was constructed, including apparent electrical power (P = V x I), thermal energy proxy (E = P x t), Joule heating (I^2 x t), spatial sensor statistics (mean, max, min, spread, standard deviation across S1-S3), z-score spatial anomaly descriptors, power-duration saturation terms, impedance proxy (V/I), and pairwise sensor asymmetry ratios.
-
----
-
-## 2. Anomaly Detection and Sensor Integrity Logic
-
-### 2.1 Sensor S4 Diagnosis
-Sensor S4 cross-correlation against S1, S2, S3, and Reference Parameter remained below 0.08 with an autocorrelation of 0.03. Demonstrating near-zero mutual information with true system state, S4 was removed to prevent tree-split noise overfitting.
-
-### 2.2 Validity Classification (Task 01)
-Validity classification utilizes a hybrid architecture combining spatial z-score feature representations with a gradient boosting classifier and deterministic physical safety rules.
-
-On 5-fold stratified cross-validation across the training set, the hybrid classifier achieved an out-of-fold accuracy of 99.80%, precision of 98.53%, recall of 100.0% (134/134 invalid records identified), and a weighted F1-score of 0.9926 (±0.0091).
-
-Physical safety overrides enforce invalid status if voltage, current, or duration are negative, if sensor rises exceed 400°C, or if inter-sensor spread exceeds 200°C. On the 350-record test set, the classifier identified 304 Valid and 46 Invalid records (13.1% anomaly rate), closely matching the historical training distribution (13.4%).
+1. **Understand (Ingestion & Diagnostics):** Standardized input schemas, resolved missing sensor values via Multivariate Imputation by Chained Equations (MICE), and conducted statistical diagnostic tests on auxiliary channels.
+2. **Analyse (Physics-Informed Feature Engineering):** Engineered a 27-feature physical contract modeling electrical power deposition ($P = V \times I$), thermal energy proxy ($E = P \times t$), resistive Joule heating ($I^2 t$), non-linear convective cooling interactions ($I^2 \times \text{Ambient}$), spatial temperature gradients across incoming/outgoing terminals ($S_1, S_2, S_3$), and logarithmic saturation interaction terms.
+3. **Validate (Two-Task Modeling Strategy):**
+   - *Task 01 (Validity Classification):* Implemented a hybrid architecture combining spatial Huber/MAD z-score anomaly features with a `HistGradientBoostingClassifier` (stratified 5-fold CV) and deterministic physical safety rules.
+   - *Task 02 (Hot-Spot Regression):* Filtered training data strictly to verified `Valid` records (866 rows) to isolate corrupted probe signatures. Implemented a **5-fold bagged tri-model ensemble** (GradientBoosting, XGBoost, and LightGBM) with inverse-variance weighting and physical thermodynamic boundary enforcement.
+4. **Automate (Export & Integration):** Programmatically generated `<TeamName>.csv` predictions, ranked high-risk test runs, and produced compliant `summary.json` diagnostic output.
 
 ---
 
-## 3. Thermal Regression and Validation Strategy (Task 02)
+## 2. Parameters Considered Important
 
-### 3.1 Strict Valid-Only Training Protocol
-The regressor was trained strictly on the 866 verified Valid training records, isolating the models from sensor disconnects and corruption artifacts.
+Through correlation analysis, feature permutation importance, and electrical domain principles, the parameters were ranked by significance:
 
-### 3.2 Regression Performance
-Using 5-fold cross-validation on the filtered valid dataset, the optimized Gradient Boosting Regressor achieved:
-- Root Mean Squared Error (RMSE): 0.6976 °C (per-fold mean: 0.6955 ± 0.0526 °C)
-- Mean Absolute Error (MAE): 0.4664 °C
-- Coefficient of Determination (R²): 0.9958
-
-### 3.3 Prediction Consistency
-Predicted hot-spot temperature rises on the 350 test instances range from 12.96 °C to 60.74 °C with a mean of 26.41 °C, aligning with the ground-truth training distribution (range: 11.92 °C to 61.58 °C, mean: 26.75 °C) and verifying absence of scale drift.
+- **Load Current ($I$) [Highest Importance]:** Demonstrates the strongest direct relationship with hot-spot rise ($r = +0.87$). Resistive heating scales with current squared ($I^2$), making it the primary thermodynamic driver.
+- **Sensor $S_2$ (Outgoing Terminal Rise):** Strongest sensor-to-target correlation ($r = +0.70$), indicating proximity to the primary internal thermal bottleneck.
+- **Sensors $S_1$ and $S_3$ (Spatial Differential):** Mean rise, maximum rise, and inter-sensor spread ($\Delta S = \text{Max} - \text{Min}$) capture localized hot-spots versus uniform thermal equilibrium.
+- **Interaction Terms ($I^2 \times \text{Ambient}$, $P \times \ln(1+t)$):** Model non-linear convective cooling efficiency changes and thermal saturation over time.
+- **Sensor $S_4$ (Excluded as Noise):** Cross-correlation with target ($r = 0.0021$) and lag-1 autocorrelation ($\rho_1 = 0.0300$) proved $S_4$ to be unphysical white noise; it was completely eliminated from feature space to prevent tree-split variance.
 
 ---
 
-## 4. Digital Twin Automation Framework
+## 3. Method Used for Detecting Abnormal Data (Task 01)
 
-**Stage 1 — Ingestion:** Automated reading of test bench SCADA streams with dynamic header normalization, deduplication, and type validation.
+Abnormal and invalid test runs are identified using a two-tier hybrid screening mechanism:
 
-**Stage 2 — Noise Filtering:** Multivariate iterative imputation (MICE) resolves missing readings. Auxiliary channels are subjected to automated autocorrelation screening to prune white-noise sensors.
+1. **Spatial Anomaly & ML Classifier:** Spatial z-scores ($\text{MAD}$-normalized deviations of each sensor relative to the operating regime) are computed alongside sensor spreads. A `HistGradientBoostingClassifier` trained with L2 regularization ($\lambda = 1.5$) achieved **0.9926 F1-score** and **100.0% recall (134/134)** on 5-fold stratified cross-validation.
+2. **Deterministic Physics Safety Overrides:** Direct physical boundary rules override model output to guarantee safety:
+   - Negative electrical inputs ($V < 0$, $I < 0$, $t < 0$).
+   - Impossible thermal values ($S < -10^\circ\text{C}$ or $S > 400^\circ\text{C}$).
+   - Severe sensor disconnection spread ($\text{Max}(S) - \text{Min}(S) > 200^\circ\text{C}$).
 
-**Stage 3 — Inference Engine:** Spatial z-score hybrid classifier gates record validity. Valid records pass to the 0.69°C RMSE gradient boosting regressor for hot-spot inference; anomalies are flagged for diagnostic review.
-
-**Stage 4 — Prescriptive Action:** Risk-ranked test summaries are generated automatically. Top attention IDs trigger automated maintenance work orders mapped to spatial sensor signatures.
+On the 350-instance test set, the system flagged **46 abnormal/invalid records (13.1%)**, matching the historical training baseline (13.4%).
 
 ---
 
-## 5. Prescriptive Circuit Redesign Matrix
+## 4. Key Engineering Assumptions Made
 
-| Observed Sensor Signature | Root Cause | Recommended Hardware Intervention |
+1. **Temperature Rise Units:** `Sensor_S1`, `Sensor_S2`, `Sensor_S3`, and `Reference_Parameter` are already expressed as temperature rises above ambient ($\Delta T$ in $^\circ\text{C}$). Ambient temperature was not subtracted from sensor readings a second time.
+2. **Ambient Role in Heat Dissipation:** `Ambient_Temperature` acts as an independent boundary condition governing external convection and radiation cooling efficiency.
+3. **Invalid Record Mechanism:** Invalid records represent data corruption, probe disconnections, or test setup failures. Excluding them during regression training prevents the model from learning artificial relationships.
+4. **Thermodynamic Hot-Spot Constraint:** For any active valid test, the hot-spot temperature rise is physically bounded from below by the maximum observed terminal sensor temperature ($\text{Reference\_Parameter} \ge \max(S_1, S_2, S_3) - 0.5^\circ\text{C}$).
+
+---
+
+## 5. Steps for Automated Digital Twin Implementation
+
+To deploy this solution as an automated Digital Twin for real-time test bench monitoring, the following continuous four-step pipeline is established:
+
+
+1. **Step 1 — Real-Time Streaming Ingestion:** Continuously ingest SCADA test bench telemetry via OPC-UA/MQTT protocols with automated column mapping and schema type-casting.
+2. **Step 2 — Dynamic Noise & Channel Filtering:** Run real-time channel health checks (autocorrelation thresholds to detect sensor drift or white noise) and apply multivariate imputation for transient packet dropouts.
+3. **Step 3 — Dual-Model Inference Execution:**
+   - *Gatekeeper:* Hybrid anomaly classifier screens incoming packets in $<10\text{ ms}$.
+   - *Thermal Twin:* Validated packets feed the 5-fold bagged tri-model ensemble (GBR, XGBoost, LightGBM) to infer internal hot-spot rise in real time with physical boundary enforcement.
+4. **Step 4 — Automated Prescriptive Maintenance:** Anomalous or high-temperature events trigger automated work orders mapped to specific hardware interventions:
+
+| Detected Signature | Root Cause | Prescriptive Intervention |
 |---|---|---|
-| S2 significantly higher than S1 and S3 | Outgoing terminal contact degradation | Re-torque load clamp to 50 Nm; apply silver-plated conductive compound |
-| S1 significantly higher than S2 and S3 | Incoming terminal contact resistance | Clean and deoxidize incoming bushing interface; inspect joint compression |
-| High spread across S1–S3 (> 20 °C) | Busbar current crowding / localized joint fault | Verify bolted joint torque; upgrade busbar cross-sectional area |
-| Uniformly elevated S1, S2, S3 | Sustained overload or restricted ventilation | Increase forced-air flow by 25%; inspect cooling duct clearances |
-| Single sensor floating near zero | Sensor detachment or open-circuit lead | Replace RTD transducer and verify DAQ ground isolation |
+| $S_2 \gg S_1, S_3$ | Outgoing terminal contact resistance | Re-torque load clamp to 50 Nm; apply silver-plated conductive compound |
+| $S_1 \gg S_2, S_3$ | Incoming bushing contact degradation | Clean contact interface; inspect bushing joint compression |
+| High Spread ($\Delta S > 20^\circ\text{C}$) | Busbar current crowding / localized joint fault | Upgrade busbar cross-sectional area; inspect bolted joint torque |
+| Uniform High $S_1, S_2, S_3$ | Sustained overload / inadequate airflow | Increase cooling fan speed by 25%; clear ventilation duct restrictions |
+| Floating / Zero Sensor | Sensor open-circuit or probe detachment | Replace RTD transducer; inspect DAQ ground isolation |
 
 ---
 

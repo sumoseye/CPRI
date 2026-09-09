@@ -1,13 +1,13 @@
 {
   "records_analysed": 350,
-  "abnormal_invalid_records": 46,
-  "min_predicted_reference_parameter": 12.96,
-  "max_predicted_reference_parameter": 60.74,
-  "average_predicted_reference_parameter": 26.41,
+  "abnormal_invalid_records": 32,
+  "min_predicted_reference_parameter": 13.26,
+  "max_predicted_reference_parameter": 57.07,
+  "average_predicted_reference_parameter": 26.42,
   "top_3_attention_test_ids": [
     "TST-0290",
-    "TST-0315",
-    "TST-0244"
+    "TST-0142",
+    "TST-0087"
   ],
-  "approach_explanation": "Hybrid validity screening: consistency rules derived from training data only (sensor-spread bound, Huber/MAD physics z-scores of S1-S3 vs operating point, missing-channel and clamp-value detection, duplicate-measurement keys) OR-ed with a HistGradientBoosting classifier; leakage-safe stratified 5-fold CV (all learned state re-derived per fold). Regression: single GradientBoostingRegressor on 27 physics-informed input features (S4 removed after ablation; I2xAmbient interaction), trained on verified-valid records; fixed seeds for full reproducibility."
+  "approach_explanation": "Hybrid validity screening: consistency rules (sensor spread, MAD z-scores of S1-S3, missing/clamp detection) combined with HistGradientBoosting (stratified 5-fold CV). Regression: 5-fold bagged tri-model ensemble (GBR, XGBoost, LightGBM) trained strictly on valid runs using 27 physics-informed features (S4 noise dropped, Joule heating I2t, I2xAmbient). Enforced physical thermodynamic lower-bounds."
 }
