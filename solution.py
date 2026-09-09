@@ -3,7 +3,7 @@
 ===============================================================================
 PowerNext-AI 2026: The Black-Box Test Bench Challenge
 Organized by: CPRI & MIT Bengaluru
-Team: CPRI_Winners
+Team: Kori_Rotti
 Strategy: Understand -> Analyse -> Validate -> Automate
 ===============================================================================
 """
