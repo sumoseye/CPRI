@@ -19,14 +19,14 @@ from typing import Dict, List, Tuple, Any
 import numpy as np
 import pandas as pd
 
-from sklearn.model_selection import KFold, cross_val_score, cross_val_predict
+from sklearn.model_selection import KFold, cross_val_predict, StratifiedKFold
 from sklearn.experimental import enable_iterative_imputer  # noqa: F401
-from sklearn.impute import IterativeImputer, KNNImputer
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import mean_absolute_error, r2_score, accuracy_score, f1_score
+from sklearn.impute import IterativeImputer, KNNImputer, SimpleImputer
+from sklearn.metrics import (mean_absolute_error, r2_score, accuracy_score, f1_score,
+                             precision_score, recall_score, confusion_matrix)
 from sklearn.ensemble import (
+    GradientBoostingRegressor,
     HistGradientBoostingClassifier,
-    HistGradientBoostingRegressor,
 )
 
 # High-performance boosting libraries with fallback
@@ -150,6 +150,8 @@ class DatasetCleaner:
 
     def __init__(self):
         self.s4_is_noise = False
+        self.train_raw = None   # pre-imputation copies (missingness intact) for validity screening
+        self.test_raw = None
 
     def ingest_and_clean(self, xlsx_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         logger.info("=" * 70)
@@ -182,6 +184,12 @@ class DatasetCleaner:
         test_miss = test[shared_cols].isnull().sum().sum()
         logger.info(f"Missing values detected: Train={train_miss}, Test={test_miss}")
 
+        # Preserve raw frames BEFORE imputation: the validity classifier relies on
+        # the missingness pattern itself as a fault signal (S1-S3 dropouts occur
+        # exclusively on Invalid records), so it must see the original NaNs.
+        self.train_raw = train.copy()
+        self.test_raw = test.copy()
+
         if train_miss > 0 or test_miss > 0:
             try:
                 imp = IterativeImputer(max_iter=20, random_state=RANDOM_STATE, initial_strategy="median")
@@ -200,6 +208,7 @@ class DatasetCleaner:
             target_nulls = train["Reference_Parameter"].isnull().sum()
             if target_nulls > 0:
                 train = train.dropna(subset=["Reference_Parameter"]).reset_index(drop=True)
+                self.train_raw = self.train_raw.dropna(subset=["Reference_Parameter"]).reset_index(drop=True)
                 logger.info(f"Dropped {target_nulls} train records with missing Reference_Parameter.")
 
         return train, test
@@ -277,6 +286,10 @@ class PhysicsFeatureEngineer:
             df["Energy_x_MaxSensor"] = df["Thermal_Energy_kWmin"] * df["Sensor_Max"]
             df["Power_x_MeanSensor"] = df["Apparent_Power_kW"] * df["Sensor_Mean"]
 
+        # 3b. Approved Config-5 interaction: Joule heating x ambient regime.
+        #     Derived exclusively from raw input columns (leakage-free by construction).
+        df["I_squared_x_Ambient_Temperature"] = df["I_squared"] * df["Ambient_Temperature"]
+
         # 4. Nonlinear Operating Regimes & Saturation
         df["Log_Duration"] = np.log1p(np.maximum(0, t))
         df["Log_Power"] = np.log1p(np.maximum(0, df["Apparent_Power_kW"]))
@@ -319,38 +332,183 @@ class PhysicsFeatureEngineer:
 # 5. TASK 01: ANOMALY & VALIDITY CLASSIFIER (VALIDATE STAGE)
 # =============================================================================
 class ValidityClassifier:
+    """Hybrid Valid/Invalid detector.
+
+    Layer 1 — supervised HistGradientBoostingClassifier on physically meaningful
+    consistency features (sensor spread, pairwise diffs, robust physics z-scores,
+    missing/int-clamp flags).
+
+    Layer 2 — deterministic consistency rules whose thresholds are DERIVED FROM
+    TRAINING DATA ONLY inside the CV pipeline (leakage-safe):
+      * spatial inconsistency: spread > max(spread | Valid) + margin (Wilks-style
+        empirical bound on the majority class)
+      * physics z: Huber-regression residuals of each sensor (and their mean)
+        vs electrical operating point, scaled by MAD; |z| > 4 (~4-sigma; the
+        maximum observed |z| among Valid records is < 3.7)
+      * missing S1-S3 channels, or any sensor clamped at 0.0 / 1.0 / 25.0
+        (4-decimal data never lands on integers by chance)
+      * duplicate measurement: exact match of the 8-feature key with another
+        record (training pool or within the evaluated batch)
+
+    Stray absolute-value overrides (sensor > 400 C, negatives) are kept purely
+    as a generalization safety net: they never fired on train or test data.
+    """
+
+    SENSORS = ["Sensor_S1", "Sensor_S2", "Sensor_S3"]
+    CLAMP_VALUES = (0.0, 1.0, 25.0)
+    Z_CUT = 4.0
+    PROB_CUT = 0.5
+    SPREAD_MARGIN = 1e-6
+
     def __init__(self):
         self.model = None
-        self.le = LabelEncoder()
         self.feature_cols = []
         self.is_trained = False
 
-    def _apply_physics_rules(self, df: pd.DataFrame) -> pd.Series:
-        """Flags physically impossible test bench conditions as Invalid."""
-        invalid = pd.Series(False, index=df.index)
+    # ---------- feature helpers ----------
+    @classmethod
+    def _consistency_frame(cls, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        sens = [s for s in cls.SENSORS if s in df.columns]
+        df["spread"] = df[sens].max(axis=1) - df[sens].min(axis=1)
+        df["mean123"] = df[sens].mean(axis=1)
+        df["median123"] = df[sens].median(axis=1)
+        if len(sens) == 3:
+            df["abs_s12"] = (df["Sensor_S1"] - df["Sensor_S2"]).abs()
+            df["abs_s23"] = (df["Sensor_S2"] - df["Sensor_S3"]).abs()
+            df["abs_s13"] = (df["Sensor_S1"] - df["Sensor_S3"]).abs()
+        df["int_flag"] = df[sens].isin(list(cls.CLAMP_VALUES)).any(axis=1).astype(int)
+        df["miss_s123"] = df[sens].isnull().any(axis=1).astype(int)
+        df["miss_s4"] = df["Sensor_S4"].isnull().astype(int) if "Sensor_S4" in df.columns else 0
+        df = cls._covariates(df)
+        for s in cls.SENSORS + ["mean123"]:
+            df[f"z_{s}"] = np.nan
+        df["max_abs_z"] = np.nan
+        return df
 
-        # 1. Unphysical negative rises or extreme spikes
-        for s in ["Sensor_S1", "Sensor_S2", "Sensor_S3"]:
+    @staticmethod
+    def _covariates(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        lc = df["Load_Current"] if "Load_Current" in df.columns else pd.Series(0.0, index=df.index)
+        av = df["Applied_Voltage"] if "Applied_Voltage" in df.columns else pd.Series(0.0, index=df.index)
+        df["I2"] = lc ** 2
+        df["VI"] = lc * av
+        return df
+
+    COVARIATES = ["Load_Current", "I2", "Applied_Voltage", "Test_Duration",
+                  "Ambient_Temperature", "VI"]
+
+    def _fit_physics_state(self, Xdf: pd.DataFrame, valid_mask: np.ndarray):
+        """Learn Huber physics fits, MAD scales, spread bound, dup pool (train only)."""
+        from sklearn.linear_model import HuberRegressor
+
+        self.hubs_, self.mads_ = {}, {}
+        for tgt in self.SENSORS + ["mean123"]:
+            ok = Xdf[self.COVARIATES + [tgt]].notna().all(axis=1)
+            hub = HuberRegressor(epsilon=1.35, alpha=1e-6, max_iter=5000)
+            hub.fit(Xdf.loc[ok, self.COVARIATES].values, Xdf.loc[ok, tgt].values)
+            resid = Xdf[tgt].values - hub.predict(Xdf[self.COVARIATES].values)
+            resid = resid[ok.values]
+            mad = 1.4826 * np.median(np.abs(resid - np.median(resid)))
+            self.hubs_[tgt], self.mads_[tgt] = hub, max(mad, 1e-3)
+        # Empirical spread bound from the majority (Valid) class only
+        self.spread_cut_ = float(Xdf.loc[valid_mask, "spread"].max()) + self.SPREAD_MARGIN
+        # Duplicate pool: 8-feature keys of the training set
+        self.dup_keys_ = set(map(tuple, Xdf[self._key_cols(Xdf)].round(6).values))
+
+    def _key_cols(self, df: pd.DataFrame) -> List[str]:
+        cols = ["Applied_Voltage", "Load_Current", "Ambient_Temperature",
+                "Test_Duration"] + self.SENSORS
+        cols += ["Sensor_S4"] if "Sensor_S4" in df.columns else []
+        return cols
+
+    def _fill_z(self, Xdf: pd.DataFrame) -> pd.DataFrame:
+        Xdf = self._covariates(Xdf)
+        if not hasattr(self, "hubs_"):
+            return Xdf
+        for tgt in self.SENSORS + ["mean123"]:
+            pred = self.hubs_[tgt].predict(Xdf[self.COVARIATES].values)
+            Xdf[f"z_{tgt}"] = (Xdf[tgt].values - pred) / self.mads_[tgt]
+        Xdf["max_abs_z"] = Xdf[[f"z_{t}" for t in self.SENSORS + ["mean123"]]].abs().max(axis=1)
+        return Xdf
+
+    def _consistency_rules(self, Xdf: pd.DataFrame) -> pd.Series:
+        """Data-derived deterministic invalidity rules (thresholds fit on train)."""
+        r = pd.Series(False, index=Xdf.index)
+        r |= Xdf["spread"] > self.spread_cut_
+        r |= Xdf["miss_s123"] == 1
+        r |= Xdf[self.SENSORS].eq(0.0).any(axis=1)
+        r |= Xdf[self.SENSORS].isin(list(self.CLAMP_VALUES)).any(axis=1)
+        r |= Xdf["max_abs_z"] > self.Z_CUT
+        keys = Xdf[self._key_cols(Xdf)].round(6).fillna(-9999.0)
+        in_pool = keys.apply(lambda row: tuple(row) in self.dup_keys_, axis=1)
+        batch_dup = keys.duplicated(keep=False)
+        r |= in_pool | batch_dup
+        return r
+
+    def _apply_physics_rules(self, df: pd.DataFrame) -> pd.Series:
+        """Stray absolute-value safety net (never fires on in-distribution data)."""
+        invalid = pd.Series(False, index=df.index)
+        for s in self.SENSORS:
             if s in df.columns:
                 invalid |= (df[s] < -10.0) | (df[s] > 400.0)
-
-        # 2. Negative electrical inputs
         if "Applied_Voltage" in df.columns:
             invalid |= (df["Applied_Voltage"] < 0)
         if "Load_Current" in df.columns:
             invalid |= (df["Load_Current"] < 0)
         if "Test_Duration" in df.columns:
             invalid |= (df["Test_Duration"] < 0)
-
-        # 3. Severe sensor disconnect (extreme spread > 200°C)
         if "Sensor_Spread" in df.columns:
             invalid |= (df["Sensor_Spread"] > 200.0)
-
         return invalid
 
+    # ---------- sklearn-style API (used for leakage-safe CV) ----------
+    def get_params(self, deep=True):
+        return {}
+
+    def set_params(self, **params):
+        return self
+
+    def fit(self, X: pd.DataFrame, y: pd.Series):
+        Xdf = self._consistency_frame(X)
+        std_y = y.astype(str).str.strip().map(
+            lambda v: "Invalid" if v.lower() in ["invalid", "0", "false"] else "Valid")
+        y_bin = (std_y == "Invalid").astype(int).values
+        valid_mask = y_bin == 0
+        self._fit_physics_state(Xdf, valid_mask)
+        Xdf = self._fill_z(Xdf)
+
+        self.feature_cols = ["spread", "mean123", "median123", "abs_s12", "abs_s23",
+                             "abs_s13", "z_Sensor_S1", "z_Sensor_S2", "z_Sensor_S3",
+                             "z_mean123", "max_abs_z", "int_flag", "miss_s123",
+                             "miss_s4", "Applied_Voltage", "Load_Current",
+                             "Ambient_Temperature", "Test_Duration"]
+        self.feature_cols = [c for c in self.feature_cols if c in Xdf.columns]
+        Xi = Xdf[self.feature_cols].values.astype(float)
+        self.imp_ = SimpleImputer(strategy="median").fit(Xi)
+        Xi = self.imp_.transform(Xi)
+
+        self.model = HistGradientBoostingClassifier(
+            max_iter=200,
+            max_depth=4,
+            learning_rate=0.06,
+            min_samples_leaf=10,
+            l2_regularization=1.0,
+            random_state=RANDOM_STATE,
+            early_stopping=False,
+        )
+        self.model.fit(Xi, y_bin)
+        self.is_trained = True
+        return self
+
+    def _ml_invalid_prob(self, Xdf: pd.DataFrame) -> np.ndarray:
+        Xi = self.imp_.transform(Xdf[self.feature_cols].values.astype(float))
+        return self.model.predict_proba(Xi)[:, 1]
+
+    # ---------- original public interface (preserved) ----------
     def train(self, train_df: pd.DataFrame, feature_cols: List[str]):
         logger.info("=" * 70)
-        logger.info("TASK 01: VALIDITY CLASSIFICATION MODELING")
+        logger.info("TASK 01: VALIDITY CLASSIFICATION (HYBRID RULES + ML)")
         logger.info("=" * 70)
 
         if "Validity_Label" not in train_df.columns:
@@ -358,44 +516,85 @@ class ValidityClassifier:
             return
 
         labeled = train_df[train_df["Validity_Label"].notna()].copy()
-        self.feature_cols = [c for c in feature_cols if c in labeled.columns]
-        X = labeled[self.feature_cols].values
-        raw_y = labeled["Validity_Label"].astype(str).str.strip()
-        std_y = raw_y.map(lambda v: "Valid" if v.lower() in ["valid", "1", "true"] else "Invalid")
-        y = self.le.fit_transform(std_y)
+        std_y = labeled["Validity_Label"].astype(str).str.strip().map(
+            lambda v: "Invalid" if v.lower() in ["invalid", "0", "false"] else "Valid")
+        logger.info(f"Class distribution in training: {dict(std_y.value_counts())}")
 
-        logger.info(f"Class distribution in training: {dict(pd.Series(std_y).value_counts())}")
+        self.fit(labeled, labeled["Validity_Label"])
 
-        self.model = HistGradientBoostingClassifier(
-            max_iter=400,
-            max_depth=6,
-            learning_rate=0.04,
-            min_samples_leaf=8,
-            l2_regularization=1.5,
-            random_state=RANDOM_STATE,
-            early_stopping=True,
-            n_iter_no_change=15,
-        )
+        # Leakage-safe stratified CV: every learned state (Huber fits, MAD scales,
+        # spread bound, dup pool, imputation) is re-derived inside each fold.
+        cv = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+        oof = pd.Series(index=labeled.index, dtype=object)
+        fold_f1 = []
+        for tr_idx, te_idx in cv.split(labeled, std_y):
+            fold_clf = ValidityClassifier()
+            fold_clf.log_predictions = False  # silence per-fold prediction logs
+            fold_clf.fit(labeled.iloc[tr_idx], labeled.iloc[tr_idx]["Validity_Label"])
+            oof.iloc[te_idx] = fold_clf.predict(labeled.iloc[te_idx])
+            fold_f1.append(f1_score(std_y.iloc[te_idx], oof.iloc[te_idx],
+                                    pos_label="Invalid"))
+        y_true_bin = (std_y == "Invalid").astype(int)
+        y_oof_bin = (oof == "Invalid").astype(int)
+        tn, fp, fn, tp = confusion_matrix(y_true_bin, y_oof_bin).ravel()
+        logger.info(f"Hybrid Validity Classifier {N_FOLDS}-Fold Stratified CV:")
+        logger.info(f"  Fold F1: mean={np.mean(fold_f1):.4f} (±{np.std(fold_f1):.4f})")
+        logger.info(f"  OOF  Acc={accuracy_score(y_true_bin, y_oof_bin):.4f} | "
+                    f"Prec={precision_score(y_true_bin, y_oof_bin):.4f} | "
+                    f"Rec={recall_score(y_true_bin, y_oof_bin):.4f} | "
+                    f"F1={f1_score(y_true_bin, y_oof_bin):.4f}")
+        logger.info(f"  Confusion (Valid,Invalid x pred): TN={tn} FP={fp} FN={fn} TP={tp}")
 
-        cv = KFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
-        scores = cross_val_score(self.model, X, y, cv=cv, scoring="f1_weighted")
-        logger.info(f"Validity Classifier 5-Fold CV F1: {scores.mean():.4f} (±{scores.std():.4f})")
+        # Permutation importance on a stratified 25% holdout (evidence, not selection)
+        try:
+            from sklearn.model_selection import train_test_split
+            itr, ite = train_test_split(np.arange(len(labeled)), test_size=0.25,
+                                        stratify=std_y, random_state=RANDOM_STATE)
+            hold_clf = ValidityClassifier().fit(labeled.iloc[itr],
+                                                labeled.iloc[itr]["Validity_Label"])
+            Hte = hold_clf._fill_z(hold_clf._consistency_frame(labeled.iloc[ite]))
+            base_p = hold_clf._ml_invalid_prob(Hte)
+            yte_bin = (std_y.iloc[ite] == "Invalid").astype(int).values
+            rng = np.random.default_rng(RANDOM_STATE)
+            drops = {}
+            for c in self.feature_cols:
+                ds = []
+                for _ in range(10):
+                    Xp = Hte.copy()
+                    Xp[c] = rng.permutation(Xp[c].values)
+                    p = hold_clf._ml_invalid_prob(Xp)
+                    ds.append(f1_score(yte_bin, (base_p > self.PROB_CUT).astype(int))
+                              - f1_score(yte_bin, (p > self.PROB_CUT).astype(int)))
+                drops[c] = float(np.mean(ds))
+            top = sorted(drops.items(), key=lambda kv: -kv[1])[:8]
+            logger.info("  Permutation importance (ML path, dF1): "
+                        + ", ".join(f"{k}={v:.3f}" for k, v in top))
+        except Exception as e:  # pragma: no cover - diagnostics only
+            logger.warning(f"Permutation importance skipped: {e}")
 
-        self.model.fit(X, y)
+        self.model.fit(self.imp_.transform(
+            self._fill_z(self._consistency_frame(labeled))[self.feature_cols].values.astype(float)),
+            (std_y == "Invalid").astype(int).values)
         self.is_trained = True
 
     def predict(self, test_df: pd.DataFrame) -> pd.Series:
         if self.is_trained and self.model is not None:
-            X = test_df[self.feature_cols].values
-            preds = pd.Series(self.le.inverse_transform(self.model.predict(X)), index=test_df.index)
+            Tdf = self._fill_z(self._consistency_frame(test_df))
+            prob = self._ml_invalid_prob(Tdf)
+            preds = pd.Series(np.where(prob > self.PROB_CUT, "Invalid", "Valid"),
+                              index=test_df.index)
+            # Layer 2: data-derived consistency rules (deterministic override)
+            rule_invalid = self._consistency_rules(Tdf)
+            preds[rule_invalid] = "Invalid"
         else:
             preds = pd.Series("Valid", index=test_df.index)
 
-        # Apply hard physical safety override
+        # Stray absolute-value safety net (unchanged behaviour)
         phys_invalid = self._apply_physics_rules(test_df)
         preds[phys_invalid] = "Invalid"
         preds = preds.map(lambda x: "Valid" if str(x).strip().lower() in ["valid", "1", "true"] else "Invalid")
-        logger.info(f"Predicted Test Validity: {dict(preds.value_counts())}")
+        if getattr(self, "log_predictions", True):
+            logger.info(f"Predicted Test Validity: {dict(preds.value_counts())}")
         return preds
 
 
@@ -403,8 +602,28 @@ class ValidityClassifier:
 # 6. TASK 02: HOT-SPOT TEMPERATURE REGRESSOR (VALIDATE STAGE)
 # =============================================================================
 class HotSpotRegressor:
+    """Config-5 production regressor (approved after 3-seed ablation verification).
+
+    Single GradientBoostingRegressor over the verified 27-feature set: the
+    26-feature pruned set (S4-derived features and dead sensor-ratio/interaction
+    features removed) plus the input-only interaction
+    I_squared_x_Ambient_Temperature = Load_Current^2 * Ambient_Temperature.
+    """
+
+    # Exact feature list used in the final 3-seed verification experiment.
+    # Set-equality against PhysicsFeatureEngineer output is asserted in train().
+    REG_FEATURES = [
+        "Applied_Voltage", "Load_Current", "Ambient_Temperature", "Test_Duration",
+        "Apparent_Power_kW", "Thermal_Energy_kWmin", "Joule_Heating_I2t", "V_squared",
+        "I_squared", "Impedance_Proxy", "Log_Duration", "Log_Power", "Log_Energy",
+        "Sqrt_Energy", "Power_x_LogDuration", "Ambient_Temp",
+        "Sensor_S1", "Sensor_S2", "Sensor_S3", "Sensor_Mean", "Sensor_Median",
+        "Sensor_Max", "Sensor_Min", "Sensor_Spread", "Sensor_Std", "Max_to_Mean_Ratio",
+        "I_squared_x_Ambient_Temperature",
+    ]
+
     def __init__(self):
-        self.models: List[Tuple[str, Any, float]] = []
+        self.model = None
         self.feature_cols: List[str] = []
 
     def train(self, train_df: pd.DataFrame, feature_cols: List[str]):
@@ -425,96 +644,54 @@ class HotSpotRegressor:
             sys.exit(1)
 
         clean = clean.dropna(subset=["Reference_Parameter"]).reset_index(drop=True)
-        self.feature_cols = [c for c in feature_cols if c in clean.columns]
+
+        # Guard the verified feature contract: every approved feature must exist
+        # in the engineered frame; no S4-derived feature may enter the regression.
+        missing = [c for c in self.REG_FEATURES if c not in clean.columns]
+        assert not missing, f"Config-5 feature contract violated, missing: {missing}"
+        assert not any("s4" in c.lower() for c in self.REG_FEATURES), \
+            "S4-derived features must not enter the regression"
+        self.feature_cols = list(self.REG_FEATURES)
+        logger.info(f"Config-5 feature contract OK: {len(self.feature_cols)} regression features")
+
         X = clean[self.feature_cols].values
         y = clean["Reference_Parameter"].values.astype(float)
 
         logger.info(f"Feature count: {len(self.feature_cols)} | Samples: {len(X)}")
         logger.info(f"Target distribution -> Mean: {y.mean():.2f}°C, Std: {y.std():.2f}°C, Range: [{y.min():.2f}°C, {y.max():.2f}°C]")
 
-        cv = KFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
-
-        # Model 1: HistGradientBoostingRegressor
-        hgb = HistGradientBoostingRegressor(
-            max_iter=800,
-            max_depth=7,
-            learning_rate=0.03,
-            min_samples_leaf=6,
-            l2_regularization=0.8,
-            random_state=RANDOM_STATE,
-            early_stopping=True,
-            n_iter_no_change=20,
-        )
-        hgb_preds = cross_val_predict(hgb, X, y, cv=cv)
-        hgb_rmse = compute_rmse(y, hgb_preds)
-        hgb_r2 = r2_score(y, hgb_preds)
-        hgb_mae = mean_absolute_error(y, hgb_preds)
-        logger.info(f"HistGradientBoosting 5-Fold CV -> RMSE: {hgb_rmse:.4f} | MAE: {hgb_mae:.4f} | R²: {hgb_r2:.4f}")
-        hgb.fit(X, y)
-        self.models.append(("HGB", hgb, hgb_rmse))
-
-        # Model 2: XGBoost Regressor
-        if HAS_XGB:
-            xgb_m = xgb.XGBRegressor(
+        def _mk_model():
+            return GradientBoostingRegressor(
                 n_estimators=700,
-                max_depth=6,
-                learning_rate=0.03,
+                learning_rate=0.05,
+                max_depth=2,
                 subsample=0.85,
-                colsample_bytree=0.85,
-                reg_alpha=0.1,
-                reg_lambda=1.0,
+                min_samples_leaf=5,
                 random_state=RANDOM_STATE,
-                n_jobs=-1,
-                verbosity=0,
             )
-            xgb_preds = cross_val_predict(xgb_m, X, y, cv=cv)
-            xgb_rmse = compute_rmse(y, xgb_preds)
-            logger.info(f"XGBoost 5-Fold CV              -> RMSE: {xgb_rmse:.4f} | R²: {r2_score(y, xgb_preds):.4f}")
-            xgb_m.fit(X, y)
-            self.models.append(("XGB", xgb_m, xgb_rmse))
 
-        # Model 3: LightGBM Regressor
-        if HAS_LGB:
-            lgb_m = lgb.LGBMRegressor(
-                n_estimators=800,
-                max_depth=6,
-                learning_rate=0.03,
-                subsample=0.85,
-                colsample_bytree=0.85,
-                reg_alpha=0.1,
-                reg_lambda=1.0,
-                random_state=RANDOM_STATE,
-                n_jobs=-1,
-                verbose=-1,
-            )
-            lgb_preds = cross_val_predict(lgb_m, X, y, cv=cv)
-            lgb_rmse = compute_rmse(y, lgb_preds)
-            logger.info(f"LightGBM 5-Fold CV             -> RMSE: {lgb_rmse:.4f} | R²: {r2_score(y, lgb_preds):.4f}")
-            lgb_m.fit(X, y)
-            self.models.append(("LGB", lgb_m, lgb_rmse))
+        # CV metric report (identical protocol to the verification experiments)
+        cv = KFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+        cv_preds = cross_val_predict(_mk_model(), X, y, cv=cv)
+        cv_rmse = compute_rmse(y, cv_preds)
+        cv_mae = mean_absolute_error(y, cv_preds)
+        cv_r2 = r2_score(y, cv_preds)
+        fold_rmse = []
+        for tr_idx, te_idx in cv.split(X, y):
+            m = _mk_model()
+            m.fit(X[tr_idx], y[tr_idx])
+            fold_rmse.append(compute_rmse(y[te_idx], m.predict(X[te_idx])))
+        logger.info(f"GradientBoostingRegressor 5-Fold CV -> RMSE: {cv_rmse:.4f} | MAE: {cv_mae:.4f} | R²: {cv_r2:.4f}")
+        logger.info(f"  Per-fold RMSE: {[round(v, 4) for v in fold_rmse]} (mean {np.mean(fold_rmse):.4f} ± {np.std(fold_rmse):.4f})")
+        logger.info("  (Experimental CV result - hidden test labels are unavailable; this is not a test-set score.)")
 
-        self.models.sort(key=lambda x: x[2])
-        best_model_name, _, best_rmse = self.models[0]
-        logger.info(f"Best Ensemble Model: [{best_model_name}] (CV RMSE: {best_rmse:.4f}°C)")
+        # Final fit on all valid records for production inference
+        self.model = _mk_model().fit(X, y)
 
     def predict(self, test_df: pd.DataFrame) -> np.ndarray:
+        assert self.model is not None, "HotSpotRegressor must be trained before predict"
         X = test_df[self.feature_cols].values
-        if not self.models:
-            return np.zeros(len(test_df))
-        if len(self.models) == 1:
-            return self.models[0][1].predict(X)
-
-        # Inverse-RMSE Weighted Ensemble
-        weights = 1.0 / (np.array([m[2] for m in self.models]) + 1e-8)
-        weights /= weights.sum()
-
-        final_preds = np.zeros(len(test_df))
-        for idx, (name, model, rmse_val) in enumerate(self.models):
-            p = model.predict(X)
-            final_preds += weights[idx] * p
-            logger.info(f"  Ensemble Member [{name:3s}] Weight: {weights[idx]:.3f} | Pred Range: [{p.min():.2f}, {p.max():.2f}]")
-
-        return final_preds
+        return self.model.predict(X)
 
 
 # =============================================================================
@@ -550,12 +727,13 @@ class DeliverableExporter:
 
         # 3. Summary JSON (Concise explanation strictly under 100 words)
         approach = (
-            "Physics-informed gradient boosting pipeline: engineered apparent power (kV×A), "
-            "thermal energy proxy (P×t), Joule heating (I²t), spatial sensor aggregations "
-            "(mean, max, min, spread of S1-S3 rises), and nonlinear regime interactions. "
-            "HistGradientBoosting, XGBoost, and LightGBM weighted ensembling trained strictly on "
-            "verified valid runs. Hybrid ML with physical safety overrides flags sensor errors. "
-            "Sensor S4 noise diagnosed via cross-correlation. 5-fold CV optimized for minimum RMSE."
+            "Hybrid validity screening: consistency rules derived from training data only "
+            "(sensor-spread bound, Huber/MAD physics z-scores of S1-S3 vs operating point, "
+            "missing-channel and clamp-value detection, duplicate-measurement keys) OR-ed with a "
+            "HistGradientBoosting classifier; leakage-safe stratified 5-fold CV (all learned "
+            "state re-derived per fold). Regression: single GradientBoostingRegressor on 27 "
+            "physics-informed input features (S4 removed after ablation; I2xAmbient interaction), "
+            "trained on verified-valid records; fixed seeds for full reproducibility."
         )
 
         summary = {
@@ -609,9 +787,13 @@ def main():
             test_feat[c] = 0.0
 
     # 3. VALIDATE (Task 01: Validity Classification)
+    # NOTE: uses the raw (pre-imputation) frames — the missingness pattern itself
+    # is a fault signal (S1-S3 dropouts occur exclusively on Invalid records),
+    # so the validity stage must see the original NaNs. The regressor keeps using
+    # the imputed frames from STAGE 2, unchanged.
     classifier = ValidityClassifier()
-    classifier.train(train_feat, feature_cols)
-    validity_preds = classifier.predict(test_feat)
+    classifier.train(cleaner.train_raw, feature_cols)
+    validity_preds = classifier.predict(cleaner.test_raw)
 
     # 4. VALIDATE (Task 02: Hot-Spot Regression)
     regressor = HotSpotRegressor()

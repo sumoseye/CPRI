@@ -1,13 +1,13 @@
 {
   "records_analysed": 350,
-  "abnormal_invalid_records": 31,
-  "min_predicted_reference_parameter": 13.21,
-  "max_predicted_reference_parameter": 58.0,
+  "abnormal_invalid_records": 46,
+  "min_predicted_reference_parameter": 12.96,
+  "max_predicted_reference_parameter": 60.74,
   "average_predicted_reference_parameter": 26.41,
   "top_3_attention_test_ids": [
     "TST-0290",
-    "TST-0142",
-    "TST-0087"
+    "TST-0315",
+    "TST-0244"
   ],
-  "approach_explanation": "Physics-informed gradient boosting pipeline: engineered apparent power (kV\u00d7A), thermal energy proxy (P\u00d7t), Joule heating (I\u00b2t), spatial sensor aggregations (mean, max, min, spread of S1-S3 rises), and nonlinear regime interactions. HistGradientBoosting, XGBoost, and LightGBM weighted ensembling trained strictly on verified valid runs. Hybrid ML with physical safety overrides flags sensor errors. Sensor S4 noise diagnosed via cross-correlation. 5-fold CV optimized for minimum RMSE."
+  "approach_explanation": "Hybrid validity screening: consistency rules derived from training data only (sensor-spread bound, Huber/MAD physics z-scores of S1-S3 vs operating point, missing-channel and clamp-value detection, duplicate-measurement keys) OR-ed with a HistGradientBoosting classifier; leakage-safe stratified 5-fold CV (all learned state re-derived per fold). Regression: single GradientBoostingRegressor on 27 physics-informed input features (S4 removed after ablation; I2xAmbient interaction), trained on verified-valid records; fixed seeds for full reproducibility."
 }
